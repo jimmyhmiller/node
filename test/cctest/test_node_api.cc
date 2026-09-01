@@ -146,3 +146,83 @@ TEST_F(NodeApiTest, AsyncCallbacksEnterOwnContext) {
   EXPECT_TRUE(state.tsfn_finalize_in_own_context);
   EXPECT_EQ(isolate_->GetCurrentContext(), env2.context());
 }
+
+namespace {
+
+struct ThreadSafeFunctionExternalFinalizerState {
+  napi_threadsafe_function tsfn;
+  bool finalizer_called = false;
+  napi_status release_status = napi_generic_failure;
+};
+
+void ThreadSafeFunctionExternalFinalizer(node_api_basic_env env,
+                                         void* data,
+                                         void* hint) {
+  auto* state = static_cast<ThreadSafeFunctionExternalFinalizerState*>(data);
+  state->finalizer_called = true;
+  state->release_status =
+      napi_release_threadsafe_function(state->tsfn, napi_tsfn_abort);
+}
+
+void ThreadSafeFunctionCallJs(napi_env env,
+                              napi_value js_callback,
+                              void* context,
+                              void* data) {}
+
+}  // namespace
+
+TEST_F(NodeApiTest, ThreadSafeFunctionExternalFinalizerDuringTeardown) {
+  const v8::HandleScope handle_scope(isolate_);
+  const Argv argv;
+  ThreadSafeFunctionExternalFinalizerState state;
+
+  {
+    Env test_env{handle_scope, argv};
+    node::Environment* env = *test_env;
+    node::LoadEnvironment(env, "");
+
+    napi_addon_register_func init = [](napi_env env, napi_value exports) {
+      addon_env = env;
+      return exports;
+    };
+    addon_env = nullptr;
+    napi_module_register_by_symbol(
+        Object::New(isolate_), Object::New(isolate_), env->context(), init,
+        NAPI_VERSION);
+    ASSERT_NE(addon_env, nullptr);
+
+    napi_value resource_name;
+    ASSERT_EQ(napi_create_string_utf8(addon_env,
+                                      "cctest",
+                                      NAPI_AUTO_LENGTH,
+                                      &resource_name),
+              napi_ok);
+    ASSERT_EQ(napi_create_threadsafe_function(addon_env,
+                                               nullptr,
+                                               nullptr,
+                                               resource_name,
+                                               0,
+                                               1,
+                                               nullptr,
+                                               nullptr,
+                                               nullptr,
+                                               ThreadSafeFunctionCallJs,
+                                               &state.tsfn),
+              napi_ok);
+
+    napi_value global;
+    napi_value external;
+    ASSERT_EQ(napi_get_global(addon_env, &global), napi_ok);
+    ASSERT_EQ(napi_create_external(addon_env,
+                                   &state,
+                                   ThreadSafeFunctionExternalFinalizer,
+                                   nullptr,
+                                   &external),
+              napi_ok);
+    ASSERT_EQ(napi_set_named_property(addon_env, global, "external", external),
+              napi_ok);
+  }
+
+  EXPECT_TRUE(state.finalizer_called);
+  EXPECT_EQ(state.release_status, napi_ok);
+}
