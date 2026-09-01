@@ -1,6 +1,8 @@
+#include <atomic>
 #include <stdio.h>
 #include <cstdio>
 #include <string>
+#include <thread>
 #include "env-inl.h"
 #include "gtest/gtest.h"
 #include "node_api_internals.h"
@@ -155,6 +157,14 @@ struct ThreadSafeFunctionExternalFinalizerState {
   napi_status release_status = napi_generic_failure;
 };
 
+struct ThreadSafeFunctionConcurrentFinalizerState {
+  napi_threadsafe_function tsfn;
+  std::atomic_bool release_thread{false};
+  std::atomic_bool thread_released{false};
+  napi_status finalizer_release_status = napi_generic_failure;
+  napi_status thread_release_status = napi_generic_failure;
+};
+
 void ThreadSafeFunctionExternalFinalizer(node_api_basic_env env,
                                          void* data,
                                          void* hint) {
@@ -168,6 +178,16 @@ void ThreadSafeFunctionCallJs(napi_env env,
                               napi_value js_callback,
                               void* context,
                               void* data) {}
+
+void ThreadSafeFunctionConcurrentExternalFinalizer(node_api_basic_env env,
+                                                    void* data,
+                                                    void* hint) {
+  auto* state = static_cast<ThreadSafeFunctionConcurrentFinalizerState*>(data);
+  state->release_thread.store(true);
+  state->finalizer_release_status =
+      napi_release_threadsafe_function(state->tsfn, napi_tsfn_abort);
+  while (!state->thread_released.load()) std::this_thread::yield();
+}
 
 }  // namespace
 
@@ -225,4 +245,69 @@ TEST_F(NodeApiTest, ThreadSafeFunctionExternalFinalizerDuringTeardown) {
 
   EXPECT_TRUE(state.finalizer_called);
   EXPECT_EQ(state.release_status, napi_ok);
+}
+
+TEST_F(NodeApiTest, ThreadSafeFunctionConcurrentReleaseDuringTeardown) {
+  const v8::HandleScope handle_scope(isolate_);
+  const Argv argv;
+  ThreadSafeFunctionConcurrentFinalizerState state;
+  std::thread thread;
+
+  {
+    Env test_env{handle_scope, argv};
+    node::Environment* env = *test_env;
+    node::LoadEnvironment(env, "");
+
+    napi_addon_register_func init = [](napi_env env, napi_value exports) {
+      addon_env = env;
+      return exports;
+    };
+    addon_env = nullptr;
+    napi_module_register_by_symbol(
+        Object::New(isolate_), Object::New(isolate_), env->context(), init,
+        NAPI_VERSION);
+    ASSERT_NE(addon_env, nullptr);
+
+    napi_value resource_name;
+    ASSERT_EQ(napi_create_string_utf8(addon_env,
+                                      "cctest",
+                                      NAPI_AUTO_LENGTH,
+                                      &resource_name),
+              napi_ok);
+    ASSERT_EQ(napi_create_threadsafe_function(addon_env,
+                                               nullptr,
+                                               nullptr,
+                                               resource_name,
+                                               0,
+                                               2,
+                                               nullptr,
+                                               nullptr,
+                                               nullptr,
+                                               ThreadSafeFunctionCallJs,
+                                               &state.tsfn),
+              napi_ok);
+
+    thread = std::thread([&state] {
+      while (!state.release_thread.load()) std::this_thread::yield();
+      state.thread_release_status =
+          napi_release_threadsafe_function(state.tsfn, napi_tsfn_release);
+      state.thread_released.store(true);
+    });
+
+    napi_value global;
+    napi_value external;
+    ASSERT_EQ(napi_get_global(addon_env, &global), napi_ok);
+    ASSERT_EQ(napi_create_external(addon_env,
+                                   &state,
+                                   ThreadSafeFunctionConcurrentExternalFinalizer,
+                                   nullptr,
+                                   &external),
+              napi_ok);
+    ASSERT_EQ(napi_set_named_property(addon_env, global, "external", external),
+              napi_ok);
+  }
+
+  thread.join();
+  EXPECT_EQ(state.finalizer_release_status, napi_ok);
+  EXPECT_EQ(state.thread_release_status, napi_ok);
 }
